@@ -6,8 +6,10 @@ import glob
 import tarfile
 import pickle
 import subprocess
+import multiprocessing
 import numpy as np
 import pandas as pd
+from PIL import Image
 from sklearn.datasets import fetch_mldata
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split
@@ -36,7 +38,7 @@ def get_cuda_version():
     """Get CUDA version"""
     if sys.platform == 'win32':
         raise NotImplementedError("Implement this!")
-    elif sys.platform == 'linux':
+    elif sys.platform == 'linux' or sys.platform == 'darwin':
         path = '/usr/local/cuda/version.txt'
         if os.path.isfile(path):
             with open(path, 'r') as f:
@@ -44,8 +46,6 @@ def get_cuda_version():
             return data
         else:
             return "No CUDA in this machine"
-    elif sys.platform == 'darwin':
-        raise NotImplementedError("Find a Mac with GPU and implement this!")
     else:
         raise ValueError("Not in Windows, Linux or Mac")
 
@@ -78,7 +78,27 @@ def get_cudnn_version():
         else:
             return "No CUDNN in this machine"
     elif sys.platform == 'darwin':
-        raise NotImplementedError("Find a Mac with GPU and implement this!")
+        candidates = ['/usr/local/cuda/include/cudnn.h',
+                      '/usr/include/cudnn.h']
+        for c in candidates:
+            file = glob.glob(c)
+            if file: break
+        if file:
+            with open(file[0], 'r') as f:
+                version = ''
+                for line in f:
+                    if "#define CUDNN_MAJOR" in line:
+                        version = line.split()[-1]
+                    if "#define CUDNN_MINOR" in line:
+                        version += '.' + line.split()[-1]
+                    if "#define CUDNN_PATCHLEVEL" in line:
+                        version += '.' + line.split()[-1]
+            if version:
+                return version
+            else:
+                return "Cannot find CUDNN version"
+        else:
+            return "No CUDNN in this machine"
     else:
         raise ValueError("Not in Windows, Linux or Mac")
 
@@ -271,6 +291,19 @@ def imdb_for_library(seq_len=100, max_features=20000, one_hot=False):
     return x_train, x_test, y_train, y_test
 
 
+def resize_im(im_loc, size=(264, 264)):
+    # Size 264 allows centre-crop of 224 for image-augmentation
+    im = Image.open(im_loc).resize(size, Image.BILINEAR).convert('RGB')
+    im.save(im_loc)
+
+
+def resize_chestxray_mp(im_list):
+    print("{} images will be resized to (264,264)".format(len(im_list)))
+    print("Images will be overwritten to save disk-space")
+    pool = multiprocessing.pool.ThreadPool(multiprocessing.cpu_count())
+    pool.map(resize_im, im_list)
+
+    
 def download_data_chextxray(csv_dest, base_url = 'https://ikpublictutorial.blob.core.windows.net/'):
                             
     # Check whether files-exist
@@ -306,7 +339,13 @@ def download_data_chextxray(csv_dest, base_url = 'https://ikpublictutorial.blob.
         subprocess.call(['azcopy', '--source', CONTAINER_URL, 
                          '--destination', container_dest, '--quiet', '--recursive'])
         print("Data Download Complete")
-        
+        print("About to overwrite images: Image.open(loc).resize((264, 264), Image.BILINEAR).convert('RGB')")
+        # Get image locations for resize
+        df = pd.read_csv(os.path.join(csv_dest, "Data_Entry_2017.csv"))
+        img_dir = os.path.join(csv_dest, "images")
+        img_locs = df['Image Index'].map(lambda im: os.path.join(img_dir, im)).values
+        resize_chestxray_mp(img_locs)
+        print("Finished resizing")  
         
 def get_imgloc_labels(img_dir, lbl_file, patient_ids):
     """ Function to process data into a list of img_locs containing string paths
@@ -339,6 +378,14 @@ def compute_roc_auc(data_gt, data_pd, classes, full=True):
     roc_auc = np.mean(roc_auc)
     return roc_auc
 
+def get_mxnet_model(prefix, epoch):
+    """Download an MXNet model if it doesn't exist"""
+    def download(url):
+        filename = url.split("/")[-1]
+        if not os.path.exists(filename):
+            urlretrieve(url, filename)
+    download(prefix+'-symbol.json')
+    download(prefix+'-%04d.params' % (epoch,))
 
 def get_train_valid_test_split(n, train=0.7, valid=0.1, test=0.2, shuffle=False):
     other_split = valid+test
